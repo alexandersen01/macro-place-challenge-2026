@@ -100,34 +100,36 @@ class GPUPlacer:
         candidates.append(("initial", initial))
         candidates.append(("initial_legalized", legalize_hard_macros(initial, benchmark)))
 
-        candidate_iters = self._candidate_iters(benchmark)
+        candidate_iters = self._analytical_iters(benchmark)
+        analytical_starts = self._analytical_starts(benchmark)
         for iters in candidate_iters:
             analytical = run_analytical_placement(
                 benchmark,
                 netlist,
                 self.device,
-                num_starts=self._candidate_starts(benchmark),
+                num_starts=analytical_starts,
                 num_iters=iters,
                 seed=self.seed,
             )
             candidates.append((f"analytical_{iters}", analytical["best_placement"]))
 
-        best_name = None
-        best_score = float("inf")
-        best_placement = initial
-        for name, candidate in candidates:
-            exact = exact_proxy_cost(candidate, benchmark, plc)
-            if int(exact["overlap_count"]) != 0:
-                continue
-            if float(exact["proxy_cost"]) < best_score:
-                best_name = name
-                best_score = float(exact["proxy_cost"])
-                best_placement = candidate.detach().clone()
+        seed_name, _, seed_placement = self._select_best_candidate(candidates, benchmark, plc)
+        analytical_won = seed_name is not None and not seed_name.startswith("initial")
+        if analytical_won:
+            analytical_round2 = run_analytical_placement(
+                benchmark,
+                netlist,
+                self.device,
+                num_starts=max(4, analytical_starts),
+                num_iters=max(120, max(candidate_iters)),
+                seed=self.seed + 1,
+                time_budget_s=60.0,
+                seed_positions=[seed_placement],
+            )
+            candidates.append((f"{seed_name}_analytical_round2", analytical_round2["best_placement"]))
 
-        if best_name is None:
-            best_name = "initial_legalized"
-            best_placement = legalize_hard_macros(initial, benchmark)
-            best_score = float(exact_proxy_cost(best_placement, benchmark, plc)["proxy_cost"])
+        best_name, best_score, best_placement = self._select_best_candidate(candidates, benchmark, plc)
+        analytical_won = best_name is not None and not best_name.startswith("initial")
 
         selected_placement = best_placement.detach().clone()
 
@@ -143,8 +145,9 @@ class GPUPlacer:
                 best_name = "soft_refined"
                 best_score = float(soft_exact["proxy_cost"])
                 selected_placement = soft_refined.detach().clone()
+                analytical_won = True
 
-        if self._use_sa_refinement(benchmark):
+        if analytical_won and self._use_sa_refinement(benchmark):
             sa_candidate = run_parallel_sa(
                 selected_placement,
                 benchmark,
@@ -174,14 +177,33 @@ class GPUPlacer:
         )
         return placement
 
-    def _candidate_iters(self, benchmark: Benchmark):
+    def _select_best_candidate(self, candidates, benchmark: Benchmark, plc):
+        best_name = None
+        best_score = float("inf")
+        best_placement = benchmark.macro_positions.clone()
+        for name, candidate in candidates:
+            exact = exact_proxy_cost(candidate, benchmark, plc)
+            if int(exact["overlap_count"]) != 0:
+                continue
+            if float(exact["proxy_cost"]) < best_score:
+                best_name = name
+                best_score = float(exact["proxy_cost"])
+                best_placement = candidate.detach().clone()
+
+        if best_name is None:
+            best_name = "initial_legalized"
+            best_placement = legalize_hard_macros(benchmark.macro_positions.clone(), benchmark)
+            best_score = float(exact_proxy_cost(best_placement, benchmark, plc)["proxy_cost"])
+        return best_name, best_score, best_placement
+
+    def _analytical_iters(self, benchmark: Benchmark) -> list[int]:
         if benchmark.num_hard_macros >= 450:
             return [5]
         if benchmark.num_hard_macros >= 320:
             return [5, 10]
         return sorted({5, 10, self.analytical_iters})
 
-    def _candidate_starts(self, benchmark: Benchmark) -> int:
+    def _analytical_starts(self, benchmark: Benchmark) -> int:
         if benchmark.num_hard_macros >= 400:
             return min(self.analytical_starts, 2)
         if benchmark.num_hard_macros >= 300:

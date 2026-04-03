@@ -14,19 +14,89 @@ from gpu_cost import compute_proxy_cost
 from net_extract import NetlistTensors
 
 
-def _check_single_overlap(
+def _check_modified_overlaps(
     positions: torch.Tensor,
     sizes: torch.Tensor,
-    idx: int,
+    modified_indices: torch.Tensor,
     safety_gap: float = 0.05,
 ) -> torch.Tensor:
-    dx = (positions[:, idx, 0].unsqueeze(1) - positions[:, :, 0]).abs()
-    dy = (positions[:, idx, 1].unsqueeze(1) - positions[:, :, 1]).abs()
-    sep_x = (sizes[idx, 0] + sizes[:, 0]).unsqueeze(0) / 2.0 + safety_gap
-    sep_y = (sizes[idx, 1] + sizes[:, 1]).unsqueeze(0) / 2.0 + safety_gap
-    overlaps = (dx < sep_x) & (dy < sep_y)
-    overlaps[:, idx] = False
-    return overlaps.any(dim=1)
+    valid = modified_indices >= 0
+    if not torch.any(valid):
+        return torch.zeros(positions.shape[0], dtype=torch.bool, device=positions.device)
+
+    gather_idx = modified_indices.clamp_min(0)
+    moved_pos = torch.gather(
+        positions,
+        1,
+        gather_idx.unsqueeze(-1).expand(-1, -1, positions.shape[-1]),
+    )
+    moved_sizes = sizes[gather_idx]
+    macro_idx = torch.arange(positions.shape[1], device=positions.device).view(1, 1, -1)
+
+    dx = (moved_pos[..., 0].unsqueeze(-1) - positions[:, None, :, 0]).abs()
+    dy = (moved_pos[..., 1].unsqueeze(-1) - positions[:, None, :, 1]).abs()
+    sep_x = (moved_sizes[..., 0].unsqueeze(-1) + sizes[:, 0].view(1, 1, -1)) / 2.0 + safety_gap
+    sep_y = (moved_sizes[..., 1].unsqueeze(-1) + sizes[:, 1].view(1, 1, -1)) / 2.0 + safety_gap
+    overlaps = (
+        valid.unsqueeze(-1)
+        & (dx < sep_x)
+        & (dy < sep_y)
+        & (macro_idx != gather_idx.unsqueeze(-1))
+    )
+    return overlaps.any(dim=(-1, -2))
+
+
+def _build_neighbor_tensors(
+    netlist: NetlistTensors,
+    num_hard_macros: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    max_degree = max((len(neighbors) for neighbors in netlist.macro_adjacency[:num_hard_macros]), default=0)
+    if max_degree == 0:
+        return (
+            torch.zeros((num_hard_macros, 0), dtype=torch.long, device=device),
+            torch.zeros((num_hard_macros, 0), dtype=torch.float32, device=device),
+            torch.zeros((num_hard_macros,), dtype=torch.long, device=device),
+        )
+
+    neighbor_ids = torch.full((num_hard_macros, max_degree), -1, dtype=torch.long, device=device)
+    neighbor_weights = torch.zeros((num_hard_macros, max_degree), dtype=torch.float32, device=device)
+    neighbor_counts = torch.zeros((num_hard_macros,), dtype=torch.long, device=device)
+    for macro_idx in range(num_hard_macros):
+        neighbors = netlist.macro_adjacency[macro_idx]
+        weights = netlist.macro_adjacency_weights[macro_idx]
+        degree = len(neighbors)
+        if degree == 0:
+            continue
+        neighbor_ids[macro_idx, :degree] = torch.tensor(neighbors, dtype=torch.long, device=device)
+        neighbor_weights[macro_idx, :degree] = torch.tensor(weights, dtype=torch.float32, device=device)
+        neighbor_counts[macro_idx] = degree
+    return neighbor_ids, neighbor_weights, neighbor_counts
+
+
+def _sample_weighted_neighbors(
+    macro_indices: torch.Tensor,
+    neighbor_ids: torch.Tensor,
+    neighbor_weights: torch.Tensor,
+    neighbor_counts: torch.Tensor,
+) -> torch.Tensor:
+    sampled = torch.full_like(macro_indices, -1)
+    if neighbor_ids.numel() == 0:
+        return sampled
+
+    counts = neighbor_counts[macro_indices]
+    valid = counts > 0
+    if not torch.any(valid):
+        return sampled
+
+    valid_indices = macro_indices[valid]
+    weights = neighbor_weights[valid_indices]
+    total = weights.sum(dim=-1, keepdim=True).clamp_min(1.0e-8)
+    target = torch.rand((valid_indices.shape[0], 1), device=macro_indices.device) * total
+    cumulative = weights.cumsum(dim=-1)
+    pick = (cumulative < target).sum(dim=-1).clamp(max=weights.shape[-1] - 1)
+    sampled[valid] = neighbor_ids[valid_indices, pick]
+    return sampled
 
 
 def _clamp_chain_positions(positions: torch.Tensor, benchmark: Benchmark) -> torch.Tensor:
@@ -56,6 +126,12 @@ def run_parallel_sa(
     movable_indices = torch.where(movable)[0].tolist()
     if not movable_indices:
         return seed_position
+    movable_tensor = torch.tensor(movable_indices, dtype=torch.long, device=device)
+    neighbor_ids, neighbor_weights, neighbor_counts = _build_neighbor_tensors(
+        netlist,
+        benchmark.num_hard_macros,
+        device,
+    )
 
     positions = base.unsqueeze(0).repeat(num_chains, 1, 1)
     jitter = torch.randn(
@@ -89,39 +165,71 @@ def run_parallel_sa(
         proposals = positions.clone()
         old_cost = current.clone()
         ops = torch.rand(num_chains, device=device)
+        chosen = movable_tensor[torch.randint(movable_tensor.numel(), (num_chains,), device=device)]
+        partner = movable_tensor[torch.randint(movable_tensor.numel(), (num_chains,), device=device)]
+        modified = torch.full((num_chains, 2), -1, dtype=torch.long, device=device)
+        modified[:, 0] = chosen
 
-        chosen = [random.choice(movable_indices) for _ in range(num_chains)]
-        partner = [random.choice(movable_indices) for _ in range(num_chains)]
-        for chain_idx in range(num_chains):
-            i = chosen[chain_idx]
-            if ops[chain_idx] < 0.5:
-                shift_scale = temperature * (0.3 + 0.7 * (1.0 - frac))
-                proposals[chain_idx, i, 0] += random.gauss(0.0, shift_scale)
-                proposals[chain_idx, i, 1] += random.gauss(0.0, shift_scale)
-            elif ops[chain_idx] < 0.7:
-                j = partner[chain_idx]
-                if i != j:
-                    tmp = proposals[chain_idx, i].clone()
-                    proposals[chain_idx, i] = proposals[chain_idx, j]
-                    proposals[chain_idx, j] = tmp
-            elif ops[chain_idx] < 0.9:
-                neighbors = netlist.macro_adjacency[i]
-                if neighbors:
-                    weights = netlist.macro_adjacency_weights[i]
-                    j = random.choices(neighbors, weights=weights, k=1)[0]
-                    alpha = random.uniform(0.05, 0.25)
-                    proposals[chain_idx, i] = proposals[chain_idx, i] + alpha * (
-                        proposals[chain_idx, j] - proposals[chain_idx, i]
-                    )
-            else:
-                proposals[chain_idx, i, 0] = benchmark.canvas_width - proposals[chain_idx, i, 0]
+        shift_mask = ops < 0.5
+        if torch.any(shift_mask):
+            shift_scale = temperature * (0.3 + 0.7 * (1.0 - frac))
+            shift = torch.randn(
+                (int(shift_mask.sum().item()), 2),
+                device=device,
+                dtype=positions.dtype,
+            ) * shift_scale
+            shift_chains = torch.nonzero(shift_mask, as_tuple=False).squeeze(-1)
+            proposals[shift_chains, chosen[shift_mask]] += shift
+
+        swap_mask = (ops >= 0.5) & (ops < 0.7) & (chosen != partner)
+        if torch.any(swap_mask):
+            swap_chains = torch.nonzero(swap_mask, as_tuple=False).squeeze(-1)
+            chosen_swap = chosen[swap_mask]
+            partner_swap = partner[swap_mask]
+            pos_i = proposals[swap_chains, chosen_swap].clone()
+            proposals[swap_chains, chosen_swap] = proposals[swap_chains, partner_swap]
+            proposals[swap_chains, partner_swap] = pos_i
+            modified[swap_chains, 1] = partner_swap
+
+        pull_mask = (ops >= 0.7) & (ops < 0.9)
+        if torch.any(pull_mask):
+            pull_chains = torch.nonzero(pull_mask, as_tuple=False).squeeze(-1)
+            chosen_pull = chosen[pull_mask]
+            sampled_neighbors = _sample_weighted_neighbors(
+                chosen_pull,
+                neighbor_ids,
+                neighbor_weights,
+                neighbor_counts,
+            )
+            valid_pull = sampled_neighbors >= 0
+            if torch.any(valid_pull):
+                valid_chains = pull_chains[valid_pull]
+                chosen_valid = chosen_pull[valid_pull]
+                neighbors_valid = sampled_neighbors[valid_pull]
+                alpha = torch.empty(
+                    (int(valid_pull.sum().item()), 1),
+                    device=device,
+                    dtype=positions.dtype,
+                ).uniform_(0.05, 0.25)
+                proposals[valid_chains, chosen_valid] = proposals[valid_chains, chosen_valid] + alpha * (
+                    proposals[valid_chains, neighbors_valid] - proposals[valid_chains, chosen_valid]
+                )
+
+        flip_mask = ops >= 0.9
+        if torch.any(flip_mask):
+            flip_chains = torch.nonzero(flip_mask, as_tuple=False).squeeze(-1)
+            proposals[flip_chains, chosen[flip_mask], 0] = (
+                benchmark.canvas_width - proposals[flip_chains, chosen[flip_mask], 0]
+            )
 
         proposals = _clamp_chain_positions(proposals, benchmark)
         proposals[:, fixed_mask] = base[fixed_mask]
 
-        invalid = torch.zeros(num_chains, dtype=torch.bool, device=device)
-        for idx in set(chosen + partner):
-            invalid |= _check_single_overlap(proposals[:, : benchmark.num_hard_macros], sizes, idx)
+        invalid = _check_modified_overlaps(
+            proposals[:, : benchmark.num_hard_macros],
+            sizes,
+            modified,
+        )
         proposals[invalid] = positions[invalid]
 
         new_cost = compute_proxy_cost(proposals, benchmark, netlist)["proxy_cost"]

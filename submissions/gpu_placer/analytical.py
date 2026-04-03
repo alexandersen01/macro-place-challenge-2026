@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import math
-from typing import Dict, List
+import time
+from typing import Dict, List, Sequence
 
 import torch
 
@@ -24,9 +25,16 @@ def _build_initializations(
     device: torch.device,
     num_starts: int,
     seed: int,
+    seed_positions: Sequence[torch.Tensor] | None = None,
 ) -> torch.Tensor:
     base = benchmark.macro_positions.to(device)
-    starts: List[torch.Tensor] = [base.clone()]
+    starts: List[torch.Tensor] = []
+
+    if seed_positions:
+        for seed_position in seed_positions:
+            starts.append(_clamp_to_canvas(seed_position.to(device=device, dtype=base.dtype), benchmark))
+
+    starts.append(base.clone())
 
     starts.append(_greedy_row_init(benchmark, device))
     starts.append(_spiral_init(benchmark, device))
@@ -113,14 +121,28 @@ def run_analytical_placement(
     num_starts: int = 8,
     num_iters: int = 600,
     seed: int = 42,
+    time_budget_s: float | None = None,
+    seed_positions: Sequence[torch.Tensor] | None = None,
 ) -> Dict[str, torch.Tensor]:
-    init = _build_initializations(benchmark, device, num_starts=num_starts, seed=seed)
+    init = _build_initializations(
+        benchmark,
+        device,
+        num_starts=num_starts,
+        seed=seed,
+        seed_positions=seed_positions,
+    )
     param = torch.nn.Parameter(init)
     optimizer = torch.optim.Adam([param], lr=max(benchmark.canvas_width, benchmark.canvas_height) / 200.0)
     fixed_mask = benchmark.macro_fixed.to(device)
     base = benchmark.macro_positions.to(device)
+    start_time = time.time()
+    executed_steps = 0
 
     for step in range(num_iters):
+        if time_budget_s is not None and step > 0 and (time.time() - start_time) >= time_budget_s:
+            break
+
+        executed_steps += 1
         frac = step / max(num_iters - 1, 1)
         gamma = max(benchmark.canvas_width, benchmark.canvas_height) * (
             0.05 * (1.0 - frac) + 0.005 * frac
@@ -164,4 +186,5 @@ def run_analytical_placement(
         "best_placement": best,
         "candidate_batch": final_batch.detach().cpu(),
         "candidate_costs": exact_proxy.detach().cpu(),
+        "executed_steps": executed_steps,
     }
