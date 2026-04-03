@@ -6,10 +6,14 @@ import torch.nn.functional as F
 from macro_place.benchmark import Benchmark
 
 from gpu_cost import (
+    _rudy_directional_maps,
+    _smooth_directional_map,
+    compute_macro_congestion_maps,
     compute_density_grid,
     compose_pin_positions,
     ensure_batched,
     ensure_feature_batched,
+    ensure_grid_batched,
     unbatch,
 )
 from net_extract import NetlistTensors
@@ -60,9 +64,16 @@ def smooth_congestion_cost(
     netlist: NetlistTensors,
     p: float = 8.0,
 ) -> torch.Tensor:
-    from gpu_cost import compute_congestion_maps
-
-    v_map, h_map = compute_congestion_maps(placement, benchmark, netlist)
+    rows = benchmark.grid_rows
+    cols = benchmark.grid_cols
+    v_net, h_net = _rudy_directional_maps(placement, benchmark, netlist)
+    v_macro, h_macro = compute_macro_congestion_maps(placement, benchmark, netlist)
+    v_grid = ensure_feature_batched(v_net)[0].view(-1, rows, cols)
+    h_grid = ensure_feature_batched(h_net)[0].view(-1, rows, cols)
+    v_smooth = ensure_grid_batched(_smooth_directional_map(v_grid, axis=1, radius=netlist.smooth_range))[0]
+    h_smooth = ensure_grid_batched(_smooth_directional_map(h_grid, axis=0, radius=netlist.smooth_range))[0]
+    v_map = v_smooth.reshape(-1, rows * cols) + ensure_feature_batched(v_macro)[0]
+    h_map = h_smooth.reshape(-1, rows * cols) + ensure_feature_batched(h_macro)[0]
     combined = torch.cat(
         [ensure_feature_batched(v_map)[0], ensure_feature_batched(h_map)[0]],
         dim=-1,

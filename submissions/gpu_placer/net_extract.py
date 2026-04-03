@@ -16,6 +16,9 @@ class NetlistTensors:
     net_mask: torch.Tensor
     net_weights: torch.Tensor
     net_cnt: float
+    two_pin_pairs: torch.Tensor
+    two_pin_net_ids: torch.Tensor
+    two_pin_weights: torch.Tensor
     macro_edges: torch.Tensor
     macro_edge_weights: torch.Tensor
     macro_adjacency: List[List[int]]
@@ -31,7 +34,6 @@ class NetlistTensors:
     vrouting_alloc: float
     hrouting_alloc: float
     smooth_range: int
-    congestion_scale: float = 1.0
 
     def to(self, device: torch.device) -> "NetlistTensors":
         return NetlistTensors(
@@ -41,6 +43,9 @@ class NetlistTensors:
             net_mask=self.net_mask.to(device),
             net_weights=self.net_weights.to(device),
             net_cnt=self.net_cnt,
+            two_pin_pairs=self.two_pin_pairs.to(device),
+            two_pin_net_ids=self.two_pin_net_ids.to(device),
+            two_pin_weights=self.two_pin_weights.to(device),
             macro_edges=self.macro_edges.to(device),
             macro_edge_weights=self.macro_edge_weights.to(device),
             macro_adjacency=self.macro_adjacency,
@@ -56,7 +61,6 @@ class NetlistTensors:
             vrouting_alloc=self.vrouting_alloc,
             hrouting_alloc=self.hrouting_alloc,
             smooth_range=self.smooth_range,
-            congestion_scale=self.congestion_scale,
         )
 
 
@@ -105,6 +109,9 @@ def build_netlist_tensors(
 
     net_pin_lists: List[List[int]] = []
     net_weights: List[float] = []
+    two_pin_pairs: List[List[int]] = []
+    two_pin_net_ids: List[int] = []
+    two_pin_weights: List[float] = []
 
     edge_dict: Dict[Tuple[int, int], float] = {}
     adjacency_pairs: Dict[int, Dict[int, float]] = {
@@ -115,11 +122,18 @@ def build_netlist_tensors(
         driver_idx = ensure_pin(driver_name)
         sink_indices = [ensure_pin(sink_name) for sink_name in sinks]
         pin_list = [driver_idx] + sink_indices
+        net_idx = len(net_pin_lists)
         net_pin_lists.append(pin_list)
 
         driver_plc_idx = plc.mod_name_to_indices[driver_name]
         driver_node = plc.modules_w_pins[driver_plc_idx]
-        net_weights.append(float(driver_node.get_weight()))
+        net_weight = float(driver_node.get_weight())
+        net_weights.append(net_weight)
+
+        for sink_idx in sink_indices:
+            two_pin_pairs.append([driver_idx, sink_idx])
+            two_pin_net_ids.append(net_idx)
+            two_pin_weights.append(net_weight)
 
         parent_macros = sorted(
             {
@@ -179,6 +193,21 @@ def build_netlist_tensors(
         net_mask=net_mask.to(device),
         net_weights=torch.tensor(net_weights, dtype=torch.float32, device=device),
         net_cnt=float(plc.net_cnt),
+        two_pin_pairs=(
+            torch.tensor(two_pin_pairs, dtype=torch.long, device=device)
+            if two_pin_pairs
+            else torch.zeros((0, 2), dtype=torch.long, device=device)
+        ),
+        two_pin_net_ids=(
+            torch.tensor(two_pin_net_ids, dtype=torch.long, device=device)
+            if two_pin_net_ids
+            else torch.zeros((0,), dtype=torch.long, device=device)
+        ),
+        two_pin_weights=(
+            torch.tensor(two_pin_weights, dtype=torch.float32, device=device)
+            if two_pin_weights
+            else torch.zeros((0,), dtype=torch.float32, device=device)
+        ),
         macro_edges=macro_edges.to(device),
         macro_edge_weights=macro_edge_weights.to(device),
         macro_adjacency=macro_adjacency,
@@ -194,5 +223,4 @@ def build_netlist_tensors(
         vrouting_alloc=float(getattr(plc, "vrouting_alloc", 0.0)),
         hrouting_alloc=float(getattr(plc, "hrouting_alloc", 0.0)),
         smooth_range=int(getattr(plc, "smooth_range", 0)),
-        congestion_scale=1.0,
     )

@@ -94,17 +94,6 @@ class GPUPlacer:
             return benchmark.macro_positions.clone()
 
         netlist = build_netlist_tensors(benchmark, plc, device=self.device)
-        with torch.no_grad():
-            initial_gpu_cong = float(
-                compute_proxy_cost(benchmark.macro_positions.to(self.device), benchmark, netlist)[
-                    "congestion_cost"
-                ]
-            )
-            initial_exact_cong = float(
-                exact_proxy_cost(benchmark.macro_positions, benchmark, plc)["congestion_cost"]
-            )
-            if initial_gpu_cong > 1.0e-8:
-                netlist.congestion_scale = initial_exact_cong / initial_gpu_cong
 
         candidates = []
         initial = benchmark.macro_positions.clone()
