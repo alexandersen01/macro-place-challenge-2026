@@ -16,7 +16,6 @@ if str(THIS_DIR) not in sys.path:
     sys.path.insert(0, str(THIS_DIR))
 
 from analytical import run_analytical_placement
-from fd_soft import optimize_soft_macros
 from gpu_cost import compute_proxy_cost, get_default_device
 from legalize import legalize_hard_macro_variants
 from net_extract import build_netlist_tensors
@@ -135,6 +134,7 @@ class GPUPlacer:
                 num_starts=analytical_starts,
                 num_iters=iters,
                 seed=self.seed,
+                time_budget_s=self._analytical_time_budget_s(benchmark),
             )
             candidate_records.extend(
                 self._score_legalize_variants(
@@ -150,56 +150,42 @@ class GPUPlacer:
                 )
             )
 
-        seed_record = self._select_best_candidate(candidate_records)
-        if self._should_run_round2(benchmark, seed_record, initial_legalized_record):
-            round2_starts = max(5, analytical_starts + 1)
-            round2_iters = max(20, max(candidate_iters))
-            analytical_round2 = run_analytical_placement(
+        best_record = self._select_best_candidate(candidate_records)
+        selected_placement = best_record["placement"].detach().clone()
+
+        if self._should_run_post_legal_refinement(benchmark, best_record):
+            refine_config = self._post_legal_refinement_config(benchmark)
+            post_legal = run_analytical_placement(
                 benchmark,
                 netlist,
                 self.device,
-                num_starts=round2_starts,
-                num_iters=round2_iters,
-                seed=self.seed + 1,
-                time_budget_s=45.0,
-                seed_positions=[seed_record["placement"]],
+                num_starts=refine_config["starts"],
+                num_iters=refine_config["iters"],
+                seed=self.seed + 7,
+                time_budget_s=refine_config["time_budget_s"],
+                seed_positions=[selected_placement],
+                overlap_weight_start=20.0,
+                overlap_weight_end=120.0,
+                density_weight_start=0.45,
+                density_weight_end=0.30,
+                congestion_weight_start=1.0,
+                congestion_weight_end=1.1,
             )
             candidate_records.extend(
                 self._score_legalize_variants(
-                    f"{seed_record['name']}_analytical_round2",
-                    analytical_round2["legalization_variants"],
+                    f"{best_record['name']}_post_legal",
+                    post_legal["legalization_variants"],
                     benchmark,
                     plc,
-                    stage="analytical_round2",
+                    stage="post_legal_refine",
                     prefix=(
-                        f"starts={round2_starts} steps={analytical_round2['executed_steps']}"
+                        f"starts={refine_config['starts']} steps={post_legal['executed_steps']}"
                     ),
                     label="legalize",
                 )
             )
-
-        best_record = self._select_best_candidate(candidate_records)
-        selected_placement = best_record["placement"].detach().clone()
-
-        if self._should_run_soft_refinement(benchmark, best_record, initial_legalized_record):
-            soft_refined = optimize_soft_macros(
-                selected_placement.to(self.device),
-                benchmark,
-                netlist,
-                num_steps=20 if benchmark.num_hard_macros > 350 else 30,
-            ).cpu()
-            soft_record = self._score_candidate(
-                "soft_refined",
-                soft_refined,
-                benchmark,
-                plc,
-                stage="soft_refine",
-                notes="force-directed soft refinement",
-            )
-            candidate_records.append(soft_record)
-            if self._is_better_record(soft_record, best_record):
-                best_record = soft_record
-                selected_placement = soft_refined.detach().clone()
+            best_record = self._select_best_candidate(candidate_records)
+            selected_placement = best_record["placement"].detach().clone()
 
         if self._should_run_sa_refinement(benchmark, best_record, initial_legalized_record):
             sa_candidate = run_parallel_sa(
@@ -280,16 +266,16 @@ class GPUPlacer:
             note = self._format_legalize_stats(f"{label} {variant['method']}", variant["stats"])
             if prefix:
                 note = f"{prefix} {note}"
-            records.append(
-                self._score_candidate(
+            record = self._score_candidate(
                     f"{base_name}_{variant['method']}",
                     variant["placement"],
                     benchmark,
                     plc,
                     stage=stage,
                     notes=note,
-                )
             )
+            record["legalize_stats"] = variant["stats"]
+            records.append(record)
         return records
 
     def _select_best_candidate(self, records: list[dict]) -> dict:
@@ -312,22 +298,7 @@ class GPUPlacer:
         return candidate["overlap_count"] == 0 and candidate["proxy_cost"] < incumbent["proxy_cost"]
 
     def _should_run_round2(self, benchmark: Benchmark, best_record: dict, baseline_record: dict) -> bool:
-        if best_record["name"].startswith("initial"):
-            return False
-        if benchmark.num_hard_macros >= 500:
-            return False
-        improvement = baseline_record["proxy_cost"] - best_record["proxy_cost"]
-        if benchmark.num_hard_macros >= 400:
-            min_gain = 0.018
-        elif benchmark.num_hard_macros >= 250:
-            min_gain = 0.012
-        else:
-            min_gain = 0.006
-        return improvement >= min_gain and (
-            best_record["congestion_cost"] >= 1.7
-            or best_record["density_cost"] >= 0.72
-            or benchmark.num_hard_macros < 220
-        )
+        return False
 
     def _should_run_soft_refinement(
         self,
@@ -335,12 +306,29 @@ class GPUPlacer:
         best_record: dict,
         baseline_record: dict,
     ) -> bool:
-        if benchmark.num_soft_macros == 0 or not self._use_soft_refinement(benchmark):
+        return False
+
+    def _should_run_post_legal_refinement(self, benchmark: Benchmark, best_record: dict) -> bool:
+        stats = best_record.get("legalize_stats")
+        if stats is None or best_record["overlap_count"] != 0:
             return False
-        if best_record["name"].startswith("initial"):
-            return False
-        improvement = baseline_record["proxy_cost"] - best_record["proxy_cost"]
-        return improvement >= 0.003 and best_record["density_cost"] >= 0.70
+        if benchmark.num_hard_macros >= 450:
+            min_disp = 220.0
+        elif benchmark.num_hard_macros >= 280:
+            min_disp = 160.0
+        else:
+            min_disp = 100.0
+        return (
+            float(stats["total_hard_displacement"]) >= min_disp
+            or float(stats["max_hard_displacement"]) >= 12.0
+        )
+
+    def _post_legal_refinement_config(self, benchmark: Benchmark) -> dict:
+        if benchmark.num_hard_macros >= 450:
+            return {"starts": 2, "iters": 12, "time_budget_s": 8.0}
+        if benchmark.num_hard_macros >= 280:
+            return {"starts": 2, "iters": 16, "time_budget_s": 10.0}
+        return {"starts": 3, "iters": 18, "time_budget_s": 12.0}
 
     def _should_run_sa_refinement(
         self,
@@ -389,20 +377,29 @@ class GPUPlacer:
 
     def _analytical_iters(self, benchmark: Benchmark) -> list[int]:
         if benchmark.num_hard_macros >= 450:
-            return [5]
+            return [30]
         if benchmark.num_hard_macros >= 320:
-            return [5, 10]
-        return sorted({5, 10, self.analytical_iters})
+            return [50]
+        return [max(self.analytical_iters, 80)]
 
     def _analytical_starts(self, benchmark: Benchmark) -> int:
         if benchmark.num_hard_macros >= 400:
             return 3
         if benchmark.num_hard_macros >= 300:
             return 4
-        return max(self.analytical_starts, 4)
+        if benchmark.num_hard_macros >= 200:
+            return max(self.analytical_starts, 4)
+        return max(self.analytical_starts, 5)
+
+    def _analytical_time_budget_s(self, benchmark: Benchmark) -> float:
+        if benchmark.num_hard_macros >= 450:
+            return 40.0
+        if benchmark.num_hard_macros >= 320:
+            return 30.0
+        return 25.0
 
     def _use_soft_refinement(self, benchmark: Benchmark) -> bool:
-        return benchmark.num_hard_macros < 400
+        return False
 
     def _use_sa_refinement(self, benchmark: Benchmark) -> bool:
         return benchmark.num_hard_macros < 340
@@ -416,12 +413,12 @@ class GPUPlacer:
 
     def _sa_steps(self, benchmark: Benchmark) -> int:
         if benchmark.num_hard_macros >= 280:
-            return min(self.sa_steps, 40)
+            return min(self.sa_steps, 30)
         if benchmark.num_hard_macros >= 200:
-            return min(self.sa_steps, 60)
-        return self.sa_steps
+            return min(self.sa_steps, 45)
+        return min(self.sa_steps, 50)
 
     def _sa_time_budget_s(self, benchmark: Benchmark) -> float:
         if benchmark.num_hard_macros >= 280:
-            return 20.0
-        return 30.0
+            return 12.0
+        return 18.0

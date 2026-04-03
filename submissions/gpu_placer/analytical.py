@@ -182,6 +182,12 @@ def run_analytical_placement(
     seed: int = 42,
     time_budget_s: float | None = None,
     seed_positions: Sequence[torch.Tensor] | None = None,
+    overlap_weight_start: float = 5.0,
+    overlap_weight_end: float = 100.0,
+    density_weight_start: float = 0.5,
+    density_weight_end: float = 0.3,
+    congestion_weight_start: float = 1.0,
+    congestion_weight_end: float = 1.0,
 ) -> Dict[str, torch.Tensor]:
     init = _build_initializations(
         benchmark,
@@ -191,7 +197,13 @@ def run_analytical_placement(
         seed_positions=seed_positions,
     )
     param = torch.nn.Parameter(init)
-    optimizer = torch.optim.Adam([param], lr=max(benchmark.canvas_width, benchmark.canvas_height) / 200.0)
+    lr = max(benchmark.canvas_width, benchmark.canvas_height) / 200.0
+    optimizer = torch.optim.Adam([param], lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=max(num_iters, 1),
+        eta_min=lr * 0.05,
+    )
     fixed_mask = benchmark.macro_fixed.to(device)
     base = benchmark.macro_positions.to(device)
     start_time = time.time()
@@ -205,17 +217,21 @@ def run_analytical_placement(
         frac = step / max(num_iters - 1, 1)
         gamma_start = 0.05
         gamma_end = 0.005
-        den_weight = 0.5
-        cong_weight = 0.5
+        den_weight = density_weight_start + (density_weight_end - density_weight_start) * frac
+        cong_weight = congestion_weight_start + (
+            congestion_weight_end - congestion_weight_start
+        ) * frac
         if benchmark.num_hard_macros >= 300:
             gamma_start = 0.06
             gamma_end = 0.004
-            cong_weight = 0.5 + 0.05 * frac
-            den_weight = 0.5 - 0.05 * frac
+            cong_weight += 0.1 * frac
+            den_weight -= 0.05 * frac
         gamma = max(benchmark.canvas_width, benchmark.canvas_height) * (
             gamma_start * (1.0 - frac) + gamma_end * frac
         )
-        overlap_weight = 1.0 + 99.0 * frac
+        overlap_weight = overlap_weight_start + (
+            overlap_weight_end - overlap_weight_start
+        ) * frac
 
         optimizer.zero_grad()
         clamped = _clamp_to_canvas(param, benchmark)
@@ -235,6 +251,7 @@ def run_analytical_placement(
         loss = wl + den_weight * den + cong_weight * cong + overlap_weight * overlap + 10.0 * bounds
         loss.mean().backward()
         optimizer.step()
+        scheduler.step()
 
         with torch.no_grad():
             projected = _clamp_to_canvas(param, benchmark)

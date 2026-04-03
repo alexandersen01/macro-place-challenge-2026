@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import random
 import time
 from typing import Optional
@@ -9,8 +8,8 @@ import torch
 
 from macro_place.benchmark import Benchmark
 
-from fd_soft import optimize_soft_macros
 from gpu_cost import compute_proxy_cost
+from legalize import legalize_hard_macros
 from net_extract import NetlistTensors
 
 
@@ -229,6 +228,7 @@ def run_parallel_sa(
             proposals[:, : benchmark.num_hard_macros],
             sizes,
             modified,
+            safety_gap=0.5,
         )
         proposals[invalid] = positions[invalid]
 
@@ -248,14 +248,6 @@ def run_parallel_sa(
         stagnant = torch.where(improved, torch.zeros_like(stagnant), stagnant + 1)
 
         if (step + 1) % 500 == 0:
-            best_idx = int(torch.argmin(best_cost).item())
-            refined = optimize_soft_macros(best[best_idx], benchmark, netlist, num_steps=30)
-            refined_cost = compute_proxy_cost(refined, benchmark, netlist)["proxy_cost"]
-            if float(refined_cost) < float(best_cost[best_idx]):
-                best[best_idx] = refined
-                best_cost[best_idx] = refined_cost
-                positions[best_idx] = refined
-                current[best_idx] = refined_cost
             reheat_mask = stagnant > 500
             if reheat_mask.any():
                 noise = torch.randn_like(positions[reheat_mask, : benchmark.num_hard_macros]) * (
@@ -267,4 +259,4 @@ def run_parallel_sa(
                 stagnant[reheat_mask] = 0
 
     best_idx = int(torch.argmin(best_cost).item())
-    return best[best_idx].detach().cpu()
+    return legalize_hard_macros(best[best_idx].detach().cpu(), benchmark, safety_gap=0.5)

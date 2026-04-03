@@ -49,6 +49,12 @@ def _pairwise_overlap_matrix(positions: np.ndarray, sep_x: np.ndarray, sep_y: np
     return overlap
 
 
+def _quadrant_index(candidate: np.ndarray, canvas_w: float, canvas_h: float) -> int:
+    right = int(candidate[0] >= canvas_w * 0.5)
+    top = int(candidate[1] >= canvas_h * 0.5)
+    return top * 2 + right
+
+
 def _search_near_center(
     idx: int,
     center: np.ndarray,
@@ -68,6 +74,11 @@ def _search_near_center(
     best_legal_pos = None
     best_partial_key = (float("inf"), float("inf"), float("inf"), float("inf"))
     best_partial_pos = current.copy()
+    quadrant_counts = np.zeros(4, dtype=np.float64)
+    for other_idx, other in enumerate(positions):
+        if other_idx == idx:
+            continue
+        quadrant_counts[_quadrant_index(other, canvas_w, canvas_h)] += 1.0
 
     for dxm in range(-radius, radius + 1):
         for dym in range(-radius, radius + 1):
@@ -84,13 +95,19 @@ def _search_near_center(
             overlap_count = float(np.count_nonzero(overlap > 0.0))
             disp_anchor = float(np.sum((candidate - anchor) ** 2))
             disp_current = float(np.sum((candidate - current) ** 2))
-            key = (disp_anchor, disp_current, overlap_count, total_overlap)
+            density_penalty = float(quadrant_counts[_quadrant_index(candidate, canvas_w, canvas_h)])
+            key = (disp_anchor + density_penalty * 0.1, disp_current, overlap_count, total_overlap)
             if total_overlap == 0.0:
                 if best_legal_key is None or key < best_legal_key:
                     best_legal_key = key
                     best_legal_pos = candidate
                 continue
-            partial_key = (total_overlap, overlap_count, disp_anchor, disp_current)
+            partial_key = (
+                total_overlap,
+                overlap_count,
+                disp_anchor + density_penalty * 0.1,
+                disp_current,
+            )
             if partial_key < best_partial_key:
                 best_partial_key = partial_key
                 best_partial_pos = candidate
@@ -352,7 +369,7 @@ def _select_legalized_result(candidates: list[tuple[np.ndarray, dict]]) -> tuple
 def legalize_hard_macro_variants(
     placement: torch.Tensor,
     benchmark: Benchmark,
-    safety_gap: float = 0.01,
+    safety_gap: float = 0.005,
     max_radius: int = 200,
 ) -> list[dict]:
     out = placement.detach().cpu().numpy().copy().astype(np.float64)
@@ -433,7 +450,7 @@ def legalize_hard_macro_variants(
 def legalize_hard_macros(
     placement: torch.Tensor,
     benchmark: Benchmark,
-    safety_gap: float = 0.01,
+    safety_gap: float = 0.005,
     max_radius: int = 200,
     return_stats: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, dict]:
