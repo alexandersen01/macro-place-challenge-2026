@@ -134,7 +134,9 @@ class GPUPlacer:
                 num_starts=analytical_starts,
                 num_iters=iters,
                 seed=self.seed,
-                time_budget_s=self._analytical_time_budget_s(benchmark),
+                time_budget_s=self._analytical_time_budget_s(benchmark, iters),
+                seed_positions=[initial_legalized_record["placement"]],
+                top_k=3,
             )
             candidate_records.extend(
                 self._score_legalize_variants(
@@ -263,16 +265,22 @@ class GPUPlacer:
     ) -> list[dict]:
         records = []
         for variant in variants:
+            candidate_rank = variant.get("candidate_rank")
+            rank_suffix = ""
+            if candidate_rank is not None:
+                rank_suffix = f"_top{int(candidate_rank) + 1}"
             note = self._format_legalize_stats(f"{label} {variant['method']}", variant["stats"])
+            if candidate_rank is not None:
+                note = f"rank={int(candidate_rank) + 1} {note}"
             if prefix:
                 note = f"{prefix} {note}"
             record = self._score_candidate(
-                    f"{base_name}_{variant['method']}",
-                    variant["placement"],
-                    benchmark,
-                    plc,
-                    stage=stage,
-                    notes=note,
+                f"{base_name}{rank_suffix}_{variant['method']}",
+                variant["placement"],
+                benchmark,
+                plc,
+                stage=stage,
+                notes=note,
             )
             record["legalize_stats"] = variant["stats"]
             records.append(record)
@@ -312,23 +320,14 @@ class GPUPlacer:
         stats = best_record.get("legalize_stats")
         if stats is None or best_record["overlap_count"] != 0:
             return False
-        if benchmark.num_hard_macros >= 450:
-            min_disp = 220.0
-        elif benchmark.num_hard_macros >= 280:
-            min_disp = 160.0
-        else:
-            min_disp = 100.0
-        return (
-            float(stats["total_hard_displacement"]) >= min_disp
-            or float(stats["max_hard_displacement"]) >= 12.0
-        )
+        return float(stats["total_hard_displacement"]) >= 5.0
 
     def _post_legal_refinement_config(self, benchmark: Benchmark) -> dict:
-        if benchmark.num_hard_macros >= 450:
-            return {"starts": 2, "iters": 12, "time_budget_s": 8.0}
-        if benchmark.num_hard_macros >= 280:
-            return {"starts": 2, "iters": 16, "time_budget_s": 10.0}
-        return {"starts": 3, "iters": 18, "time_budget_s": 12.0}
+        if benchmark.num_hard_macros >= 400:
+            return {"starts": 4, "iters": 25, "time_budget_s": 60.0}
+        if benchmark.num_hard_macros >= 200:
+            return {"starts": 5, "iters": 30, "time_budget_s": 60.0}
+        return {"starts": 6, "iters": 40, "time_budget_s": 90.0}
 
     def _should_run_sa_refinement(
         self,
@@ -338,10 +337,7 @@ class GPUPlacer:
     ) -> bool:
         if best_record["name"].startswith("initial"):
             return False
-        if not self._use_sa_refinement(benchmark):
-            return False
-        improvement = baseline_record["proxy_cost"] - best_record["proxy_cost"]
-        return improvement >= 0.008 and best_record["congestion_cost"] >= 1.6
+        return True
 
     def _log_candidate_diagnostics(
         self,
@@ -376,49 +372,51 @@ class GPUPlacer:
         )
 
     def _analytical_iters(self, benchmark: Benchmark) -> list[int]:
-        if benchmark.num_hard_macros >= 450:
-            return [30]
-        if benchmark.num_hard_macros >= 320:
-            return [50]
-        return [max(self.analytical_iters, 80)]
+        if benchmark.num_hard_macros >= 400:
+            return [5, 15, 40]
+        if benchmark.num_hard_macros >= 200:
+            return [5, 15, 50]
+        return [5, 15, 50, 150]
 
     def _analytical_starts(self, benchmark: Benchmark) -> int:
         if benchmark.num_hard_macros >= 400:
-            return 3
-        if benchmark.num_hard_macros >= 300:
-            return 4
+            return 6
         if benchmark.num_hard_macros >= 200:
-            return max(self.analytical_starts, 4)
-        return max(self.analytical_starts, 5)
+            return 8
+        return 10
 
-    def _analytical_time_budget_s(self, benchmark: Benchmark) -> float:
-        if benchmark.num_hard_macros >= 450:
-            return 40.0
-        if benchmark.num_hard_macros >= 320:
+    def _analytical_time_budget_s(self, benchmark: Benchmark, num_iters: int) -> float:
+        if num_iters <= 5:
             return 30.0
-        return 25.0
+        if num_iters <= 15:
+            return 60.0
+        if num_iters <= 50:
+            return 120.0
+        return 300.0
 
     def _use_soft_refinement(self, benchmark: Benchmark) -> bool:
         return False
 
     def _use_sa_refinement(self, benchmark: Benchmark) -> bool:
-        return benchmark.num_hard_macros < 340
+        return True
 
     def _sa_chains(self, benchmark: Benchmark) -> int:
-        if benchmark.num_hard_macros >= 280:
-            return min(self.sa_chains, 4)
+        if benchmark.num_hard_macros >= 400:
+            return 6
         if benchmark.num_hard_macros >= 200:
-            return min(self.sa_chains, 6)
-        return self.sa_chains
+            return 8
+        return 10
 
     def _sa_steps(self, benchmark: Benchmark) -> int:
-        if benchmark.num_hard_macros >= 280:
-            return min(self.sa_steps, 30)
+        if benchmark.num_hard_macros >= 400:
+            return 60
         if benchmark.num_hard_macros >= 200:
-            return min(self.sa_steps, 45)
-        return min(self.sa_steps, 50)
+            return 80
+        return 100
 
     def _sa_time_budget_s(self, benchmark: Benchmark) -> float:
-        if benchmark.num_hard_macros >= 280:
-            return 12.0
-        return 18.0
+        if benchmark.num_hard_macros >= 400:
+            return 60.0
+        if benchmark.num_hard_macros >= 200:
+            return 45.0
+        return 30.0

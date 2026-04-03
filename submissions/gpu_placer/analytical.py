@@ -188,6 +188,7 @@ def run_analytical_placement(
     density_weight_end: float = 0.3,
     congestion_weight_start: float = 1.0,
     congestion_weight_end: float = 1.0,
+    top_k: int = 1,
 ) -> Dict[str, torch.Tensor]:
     init = _build_initializations(
         benchmark,
@@ -265,7 +266,16 @@ def run_analytical_placement(
         exact_proxy = exact["proxy_cost"]
         best_idx = int(torch.argmin(exact_proxy).item())
         best_pre_legalize = final_batch[best_idx].detach().cpu()
-        legalization_variants = legalize_hard_macro_variants(best_pre_legalize, benchmark)
+        topk = min(max(top_k, 1), final_batch.shape[0])
+        topk_indices = torch.topk(exact_proxy, k=topk, largest=False).indices.tolist()
+        legalization_variants = []
+        for candidate_rank, candidate_idx in enumerate(topk_indices):
+            candidate_pre_legalize = final_batch[candidate_idx].detach().cpu()
+            for variant in legalize_hard_macro_variants(candidate_pre_legalize, benchmark):
+                variant_copy = dict(variant)
+                variant_copy["candidate_rank"] = candidate_rank
+                variant_copy["candidate_index"] = candidate_idx
+                legalization_variants.append(variant_copy)
         best, legalization_stats = legalize_hard_macros(best_pre_legalize, benchmark, return_stats=True)
 
     return {
