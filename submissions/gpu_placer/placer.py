@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import random
 import sys
 from pathlib import Path
@@ -17,7 +18,7 @@ if str(THIS_DIR) not in sys.path:
 from analytical import run_analytical_placement
 from fd_soft import optimize_soft_macros
 from gpu_cost import compute_proxy_cost, get_default_device
-from legalize import legalize_hard_macros
+from legalize import legalize_hard_macro_variants
 from net_extract import build_netlist_tensors
 from sa_refine import run_parallel_sa
 
@@ -75,12 +76,18 @@ class GPUPlacer:
         analytical_iters: int = 20,
         sa_chains: int = 8,
         sa_steps: int = 100,
+        candidate_debug: bool | None = None,
     ):
         self.seed = seed
         self.analytical_starts = analytical_starts
         self.analytical_iters = analytical_iters
         self.sa_chains = sa_chains
         self.sa_steps = sa_steps
+        self.candidate_debug = (
+            os.environ.get("GPU_PLACER_DEBUG_CANDIDATES", "0") == "1"
+            if candidate_debug is None
+            else candidate_debug
+        )
         self.device = get_default_device()
 
     def place(self, benchmark: Benchmark) -> torch.Tensor:
@@ -95,10 +102,28 @@ class GPUPlacer:
 
         netlist = build_netlist_tensors(benchmark, plc, device=self.device)
 
-        candidates = []
+        candidate_records = []
         initial = benchmark.macro_positions.clone()
-        candidates.append(("initial", initial))
-        candidates.append(("initial_legalized", legalize_hard_macros(initial, benchmark)))
+        candidate_records.append(
+            self._score_candidate(
+                "initial",
+                initial,
+                benchmark,
+                plc,
+                stage="seed",
+                notes="raw benchmark placement",
+            )
+        )
+        initial_legalized_records = self._score_legalize_variants(
+            "initial_legalized",
+            legalize_hard_macro_variants(initial, benchmark),
+            benchmark,
+            plc,
+            stage="seed",
+            label="legalize",
+        )
+        candidate_records.extend(initial_legalized_records)
+        initial_legalized_record = self._select_best_candidate(initial_legalized_records)
 
         candidate_iters = self._analytical_iters(benchmark)
         analytical_starts = self._analytical_starts(benchmark)
@@ -111,43 +136,72 @@ class GPUPlacer:
                 num_iters=iters,
                 seed=self.seed,
             )
-            candidates.append((f"analytical_{iters}", analytical["best_placement"]))
+            candidate_records.extend(
+                self._score_legalize_variants(
+                    f"analytical_{iters}",
+                    analytical["legalization_variants"],
+                    benchmark,
+                    plc,
+                    stage="analytical",
+                    prefix=(
+                        f"starts={analytical_starts} steps={analytical['executed_steps']}"
+                    ),
+                    label="legalize",
+                )
+            )
 
-        seed_name, _, seed_placement = self._select_best_candidate(candidates, benchmark, plc)
-        analytical_won = seed_name is not None and not seed_name.startswith("initial")
-        if analytical_won:
+        seed_record = self._select_best_candidate(candidate_records)
+        if self._should_run_round2(benchmark, seed_record, initial_legalized_record):
+            round2_starts = max(5, analytical_starts + 1)
+            round2_iters = max(20, max(candidate_iters))
             analytical_round2 = run_analytical_placement(
                 benchmark,
                 netlist,
                 self.device,
-                num_starts=max(4, analytical_starts),
-                num_iters=max(120, max(candidate_iters)),
+                num_starts=round2_starts,
+                num_iters=round2_iters,
                 seed=self.seed + 1,
-                time_budget_s=60.0,
-                seed_positions=[seed_placement],
+                time_budget_s=45.0,
+                seed_positions=[seed_record["placement"]],
             )
-            candidates.append((f"{seed_name}_analytical_round2", analytical_round2["best_placement"]))
+            candidate_records.extend(
+                self._score_legalize_variants(
+                    f"{seed_record['name']}_analytical_round2",
+                    analytical_round2["legalization_variants"],
+                    benchmark,
+                    plc,
+                    stage="analytical_round2",
+                    prefix=(
+                        f"starts={round2_starts} steps={analytical_round2['executed_steps']}"
+                    ),
+                    label="legalize",
+                )
+            )
 
-        best_name, best_score, best_placement = self._select_best_candidate(candidates, benchmark, plc)
-        analytical_won = best_name is not None and not best_name.startswith("initial")
+        best_record = self._select_best_candidate(candidate_records)
+        selected_placement = best_record["placement"].detach().clone()
 
-        selected_placement = best_placement.detach().clone()
-
-        if self._use_soft_refinement(benchmark):
+        if self._should_run_soft_refinement(benchmark, best_record, initial_legalized_record):
             soft_refined = optimize_soft_macros(
                 selected_placement.to(self.device),
                 benchmark,
                 netlist,
                 num_steps=20 if benchmark.num_hard_macros > 350 else 30,
             ).cpu()
-            soft_exact = exact_proxy_cost(soft_refined, benchmark, plc)
-            if int(soft_exact["overlap_count"]) == 0 and float(soft_exact["proxy_cost"]) < best_score:
-                best_name = "soft_refined"
-                best_score = float(soft_exact["proxy_cost"])
+            soft_record = self._score_candidate(
+                "soft_refined",
+                soft_refined,
+                benchmark,
+                plc,
+                stage="soft_refine",
+                notes="force-directed soft refinement",
+            )
+            candidate_records.append(soft_record)
+            if self._is_better_record(soft_record, best_record):
+                best_record = soft_record
                 selected_placement = soft_refined.detach().clone()
-                analytical_won = True
 
-        if analytical_won and self._use_sa_refinement(benchmark):
+        if self._should_run_sa_refinement(benchmark, best_record, initial_legalized_record):
             sa_candidate = run_parallel_sa(
                 selected_placement,
                 benchmark,
@@ -155,20 +209,29 @@ class GPUPlacer:
                 self.device,
                 num_chains=self._sa_chains(benchmark),
                 max_steps=self._sa_steps(benchmark),
+                time_budget_s=self._sa_time_budget_s(benchmark),
                 seed=self.seed,
             )
-            sa_exact = exact_proxy_cost(sa_candidate, benchmark, plc)
-            if int(sa_exact["overlap_count"]) == 0 and float(sa_exact["proxy_cost"]) < best_score:
-                best_name = "sa_refined"
-                best_score = float(sa_exact["proxy_cost"])
+            sa_record = self._score_candidate(
+                "sa_refined",
+                sa_candidate,
+                benchmark,
+                plc,
+                stage="sa_refine",
+                notes=f"chains={self._sa_chains(benchmark)} steps={self._sa_steps(benchmark)}",
+            )
+            candidate_records.append(sa_record)
+            if self._is_better_record(sa_record, best_record):
+                best_record = sa_record
                 selected_placement = sa_candidate.detach().clone()
 
         placement = selected_placement.detach().clone()
         gpu_cost = compute_proxy_cost(placement.to(self.device), benchmark, netlist)
+        self._log_candidate_diagnostics(benchmark, candidate_records, best_record["name"])
         print(
             f"[GPUPlacer] {benchmark.name}: "
-            f"picked={best_name} "
-            f"exact_proxy={best_score:.4f} "
+            f"picked={best_record['name']} "
+            f"exact_proxy={best_record['proxy_cost']:.4f} "
             f"proxy={float(gpu_cost['proxy_cost']):.4f} "
             f"wl={float(gpu_cost['wirelength_cost']):.4f} "
             f"den={float(gpu_cost['density_cost']):.4f} "
@@ -177,24 +240,152 @@ class GPUPlacer:
         )
         return placement
 
-    def _select_best_candidate(self, candidates, benchmark: Benchmark, plc):
-        best_name = None
-        best_score = float("inf")
-        best_placement = benchmark.macro_positions.clone()
-        for name, candidate in candidates:
-            exact = exact_proxy_cost(candidate, benchmark, plc)
-            if int(exact["overlap_count"]) != 0:
-                continue
-            if float(exact["proxy_cost"]) < best_score:
-                best_name = name
-                best_score = float(exact["proxy_cost"])
-                best_placement = candidate.detach().clone()
+    def _score_candidate(
+        self,
+        name: str,
+        candidate: torch.Tensor,
+        benchmark: Benchmark,
+        plc,
+        *,
+        stage: str,
+        notes: str = "",
+    ) -> dict:
+        placement = candidate.detach().clone()
+        exact = exact_proxy_cost(placement, benchmark, plc)
+        return {
+            "name": name,
+            "placement": placement,
+            "stage": stage,
+            "notes": notes,
+            "proxy_cost": float(exact["proxy_cost"]),
+            "wirelength_cost": float(exact["wirelength_cost"]),
+            "density_cost": float(exact["density_cost"]),
+            "congestion_cost": float(exact["congestion_cost"]),
+            "overlap_count": int(exact["overlap_count"]),
+        }
 
-        if best_name is None:
-            best_name = "initial_legalized"
-            best_placement = legalize_hard_macros(benchmark.macro_positions.clone(), benchmark)
-            best_score = float(exact_proxy_cost(best_placement, benchmark, plc)["proxy_cost"])
-        return best_name, best_score, best_placement
+    def _score_legalize_variants(
+        self,
+        base_name: str,
+        variants: list[dict],
+        benchmark: Benchmark,
+        plc,
+        *,
+        stage: str,
+        label: str,
+        prefix: str = "",
+    ) -> list[dict]:
+        records = []
+        for variant in variants:
+            note = self._format_legalize_stats(f"{label} {variant['method']}", variant["stats"])
+            if prefix:
+                note = f"{prefix} {note}"
+            records.append(
+                self._score_candidate(
+                    f"{base_name}_{variant['method']}",
+                    variant["placement"],
+                    benchmark,
+                    plc,
+                    stage=stage,
+                    notes=note,
+                )
+            )
+        return records
+
+    def _select_best_candidate(self, records: list[dict]) -> dict:
+        best_record = None
+        best_score = float("inf")
+        for record in records:
+            if record["overlap_count"] != 0:
+                continue
+            if record["proxy_cost"] < best_score:
+                best_score = record["proxy_cost"]
+                best_record = record
+        if best_record is None:
+            best_record = min(
+                records,
+                key=lambda record: (record["overlap_count"], record["proxy_cost"]),
+            )
+        return best_record
+
+    def _is_better_record(self, candidate: dict, incumbent: dict) -> bool:
+        return candidate["overlap_count"] == 0 and candidate["proxy_cost"] < incumbent["proxy_cost"]
+
+    def _should_run_round2(self, benchmark: Benchmark, best_record: dict, baseline_record: dict) -> bool:
+        if best_record["name"].startswith("initial"):
+            return False
+        if benchmark.num_hard_macros >= 500:
+            return False
+        improvement = baseline_record["proxy_cost"] - best_record["proxy_cost"]
+        if benchmark.num_hard_macros >= 400:
+            min_gain = 0.018
+        elif benchmark.num_hard_macros >= 250:
+            min_gain = 0.012
+        else:
+            min_gain = 0.006
+        return improvement >= min_gain and (
+            best_record["congestion_cost"] >= 1.7
+            or best_record["density_cost"] >= 0.72
+            or benchmark.num_hard_macros < 220
+        )
+
+    def _should_run_soft_refinement(
+        self,
+        benchmark: Benchmark,
+        best_record: dict,
+        baseline_record: dict,
+    ) -> bool:
+        if benchmark.num_soft_macros == 0 or not self._use_soft_refinement(benchmark):
+            return False
+        if best_record["name"].startswith("initial"):
+            return False
+        improvement = baseline_record["proxy_cost"] - best_record["proxy_cost"]
+        return improvement >= 0.003 and best_record["density_cost"] >= 0.70
+
+    def _should_run_sa_refinement(
+        self,
+        benchmark: Benchmark,
+        best_record: dict,
+        baseline_record: dict,
+    ) -> bool:
+        if best_record["name"].startswith("initial"):
+            return False
+        if not self._use_sa_refinement(benchmark):
+            return False
+        improvement = baseline_record["proxy_cost"] - best_record["proxy_cost"]
+        return improvement >= 0.008 and best_record["congestion_cost"] >= 1.6
+
+    def _log_candidate_diagnostics(
+        self,
+        benchmark: Benchmark,
+        records: list[dict],
+        winner_name: str,
+    ) -> None:
+        if not self.candidate_debug:
+            return
+        print(f"[GPUPlacer:candidates] {benchmark.name}")
+        for record in records:
+            marker = "*" if record["name"] == winner_name else " "
+            print(
+                f"  {marker} {record['name']:<28} "
+                f"stage={record['stage']:<17} "
+                f"proxy={record['proxy_cost']:.4f} "
+                f"wl={record['wirelength_cost']:.4f} "
+                f"den={record['density_cost']:.4f} "
+                f"cong={record['congestion_cost']:.4f} "
+                f"ov={record['overlap_count']}"
+            )
+            if record["notes"]:
+                print(f"    note={record['notes']}")
+
+    def _format_legalize_stats(self, label: str, stats: dict) -> str:
+        return (
+            f"{label} moved={stats['moved_hard_macros']} "
+            f"total_disp={stats['total_hard_displacement']:.2f} "
+            f"max_disp={stats['max_hard_displacement']:.2f} "
+            f"passes={stats['repair_passes']} "
+            f"rem_ov={stats['remaining_overlap_count']}"
+        )
 
     def _analytical_iters(self, benchmark: Benchmark) -> list[int]:
         if benchmark.num_hard_macros >= 450:
@@ -205,23 +396,32 @@ class GPUPlacer:
 
     def _analytical_starts(self, benchmark: Benchmark) -> int:
         if benchmark.num_hard_macros >= 400:
-            return min(self.analytical_starts, 2)
+            return 3
         if benchmark.num_hard_macros >= 300:
-            return min(self.analytical_starts, 3)
-        return self.analytical_starts
+            return 4
+        return max(self.analytical_starts, 4)
 
     def _use_soft_refinement(self, benchmark: Benchmark) -> bool:
         return benchmark.num_hard_macros < 400
 
     def _use_sa_refinement(self, benchmark: Benchmark) -> bool:
-        return benchmark.num_hard_macros < 300
+        return benchmark.num_hard_macros < 340
 
     def _sa_chains(self, benchmark: Benchmark) -> int:
+        if benchmark.num_hard_macros >= 280:
+            return min(self.sa_chains, 4)
         if benchmark.num_hard_macros >= 200:
             return min(self.sa_chains, 6)
         return self.sa_chains
 
     def _sa_steps(self, benchmark: Benchmark) -> int:
+        if benchmark.num_hard_macros >= 280:
+            return min(self.sa_steps, 40)
         if benchmark.num_hard_macros >= 200:
             return min(self.sa_steps, 60)
         return self.sa_steps
+
+    def _sa_time_budget_s(self, benchmark: Benchmark) -> float:
+        if benchmark.num_hard_macros >= 280:
+            return 20.0
+        return 30.0

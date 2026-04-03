@@ -16,7 +16,7 @@ from differentiable import (
     smooth_wirelength_cost,
 )
 from gpu_cost import compute_proxy_cost
-from legalize import legalize_hard_macros
+from legalize import legalize_hard_macro_variants, legalize_hard_macros
 from net_extract import NetlistTensors
 
 
@@ -38,6 +38,8 @@ def _build_initializations(
 
     starts.append(_greedy_row_init(benchmark, device))
     starts.append(_spiral_init(benchmark, device))
+    starts.append(_edge_biased_init(benchmark, device))
+    starts.append(_quadrant_spread_init(benchmark, device))
 
     gen = torch.Generator(device=device)
     gen.manual_seed(seed)
@@ -80,6 +82,32 @@ def _greedy_row_init(benchmark: Benchmark, device: torch.device) -> torch.Tensor
     return _clamp_to_canvas(out, benchmark)
 
 
+def _edge_biased_init(benchmark: Benchmark, device: torch.device) -> torch.Tensor:
+    out = benchmark.macro_positions.to(device).clone()
+    n_hard = benchmark.num_hard_macros
+    sizes = benchmark.macro_sizes[:n_hard].to(device)
+    order = torch.argsort(-(sizes[:, 0] * sizes[:, 1]))
+    counts = max(n_hard, 1)
+    for rank, idx in enumerate(order.tolist()):
+        w = float(sizes[idx, 0])
+        h = float(sizes[idx, 1])
+        frac = (rank + 0.5) / counts
+        side = rank % 4
+        if side == 0:
+            out[idx, 0] = frac * benchmark.canvas_width
+            out[idx, 1] = h / 2.0
+        elif side == 1:
+            out[idx, 0] = benchmark.canvas_width - w / 2.0
+            out[idx, 1] = frac * benchmark.canvas_height
+        elif side == 2:
+            out[idx, 0] = (1.0 - frac) * benchmark.canvas_width
+            out[idx, 1] = benchmark.canvas_height - h / 2.0
+        else:
+            out[idx, 0] = w / 2.0
+            out[idx, 1] = (1.0 - frac) * benchmark.canvas_height
+    return _clamp_to_canvas(out, benchmark)
+
+
 def _spiral_init(benchmark: Benchmark, device: torch.device) -> torch.Tensor:
     out = benchmark.macro_positions.to(device).clone()
     n_hard = benchmark.num_hard_macros
@@ -93,6 +121,37 @@ def _spiral_init(benchmark: Benchmark, device: torch.device) -> torch.Tensor:
         radius = radius_step * math.sqrt(rank + 1)
         out[idx, 0] = center_x + radius * math.cos(angle)
         out[idx, 1] = center_y + radius * math.sin(angle)
+    return _clamp_to_canvas(out, benchmark)
+
+
+def _quadrant_spread_init(benchmark: Benchmark, device: torch.device) -> torch.Tensor:
+    out = benchmark.macro_positions.to(device).clone()
+    n_hard = benchmark.num_hard_macros
+    sizes = benchmark.macro_sizes[:n_hard].to(device)
+    order = torch.argsort(-(sizes[:, 0] * sizes[:, 1]))
+    anchors = torch.tensor(
+        [
+            [benchmark.canvas_width * 0.25, benchmark.canvas_height * 0.25],
+            [benchmark.canvas_width * 0.75, benchmark.canvas_height * 0.25],
+            [benchmark.canvas_width * 0.25, benchmark.canvas_height * 0.75],
+            [benchmark.canvas_width * 0.75, benchmark.canvas_height * 0.75],
+        ],
+        device=device,
+        dtype=out.dtype,
+    )
+    radius_step = max(benchmark.canvas_width, benchmark.canvas_height) / max(math.sqrt(n_hard), 1.0) / 6.0
+    golden_angle = math.pi * (3.0 - math.sqrt(5.0))
+    for rank, idx in enumerate(order.tolist()):
+        quadrant = rank % 4
+        local_rank = rank // 4
+        angle = local_rank * golden_angle
+        radius = radius_step * math.sqrt(local_rank + 1)
+        offset = torch.tensor(
+            [math.cos(angle), math.sin(angle)],
+            device=device,
+            dtype=out.dtype,
+        )
+        out[idx] = anchors[quadrant] + radius * offset
     return _clamp_to_canvas(out, benchmark)
 
 
@@ -144,8 +203,17 @@ def run_analytical_placement(
 
         executed_steps += 1
         frac = step / max(num_iters - 1, 1)
+        gamma_start = 0.05
+        gamma_end = 0.005
+        den_weight = 0.5
+        cong_weight = 0.5
+        if benchmark.num_hard_macros >= 300:
+            gamma_start = 0.06
+            gamma_end = 0.004
+            cong_weight = 0.5 + 0.05 * frac
+            den_weight = 0.5 - 0.05 * frac
         gamma = max(benchmark.canvas_width, benchmark.canvas_height) * (
-            0.05 * (1.0 - frac) + 0.005 * frac
+            gamma_start * (1.0 - frac) + gamma_end * frac
         )
         overlap_weight = 1.0 + 99.0 * frac
 
@@ -164,7 +232,7 @@ def run_analytical_placement(
         overlap = hard_macro_overlap_penalty(clamped, benchmark, beta=2.0)
         bounds = boundary_penalty(clamped, benchmark)
 
-        loss = wl + 0.5 * den + 0.5 * cong + overlap_weight * overlap + 10.0 * bounds
+        loss = wl + den_weight * den + cong_weight * cong + overlap_weight * overlap + 10.0 * bounds
         loss.mean().backward()
         optimizer.step()
 
@@ -179,11 +247,15 @@ def run_analytical_placement(
         exact = compute_proxy_cost(final_batch, benchmark, netlist)
         exact_proxy = exact["proxy_cost"]
         best_idx = int(torch.argmin(exact_proxy).item())
-        best = final_batch[best_idx].detach().cpu()
-        best = legalize_hard_macros(best, benchmark)
+        best_pre_legalize = final_batch[best_idx].detach().cpu()
+        legalization_variants = legalize_hard_macro_variants(best_pre_legalize, benchmark)
+        best, legalization_stats = legalize_hard_macros(best_pre_legalize, benchmark, return_stats=True)
 
     return {
         "best_placement": best,
+        "best_pre_legalize": best_pre_legalize,
+        "legalization_stats": legalization_stats,
+        "legalization_variants": legalization_variants,
         "candidate_batch": final_batch.detach().cpu(),
         "candidate_costs": exact_proxy.detach().cpu(),
         "executed_steps": executed_steps,

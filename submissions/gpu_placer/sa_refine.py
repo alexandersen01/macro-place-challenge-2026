@@ -18,7 +18,7 @@ def _check_modified_overlaps(
     positions: torch.Tensor,
     sizes: torch.Tensor,
     modified_indices: torch.Tensor,
-    safety_gap: float = 0.05,
+    safety_gap: float = 0.0,
 ) -> torch.Tensor:
     valid = modified_indices >= 0
     if not torch.any(valid):
