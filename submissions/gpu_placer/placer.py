@@ -22,6 +22,34 @@ from net_extract import build_netlist_tensors
 from sa_refine import run_parallel_sa
 
 
+WEIGHT_PROFILES = {
+    "balanced": {
+        "overlap_weight_start": 5.0,
+        "overlap_weight_end": 100.0,
+        "density_weight_start": 0.5,
+        "density_weight_end": 0.3,
+        "congestion_weight_start": 1.0,
+        "congestion_weight_end": 1.0,
+    },
+    "congestion_heavy": {
+        "overlap_weight_start": 5.0,
+        "overlap_weight_end": 100.0,
+        "density_weight_start": 0.3,
+        "density_weight_end": 0.2,
+        "congestion_weight_start": 1.5,
+        "congestion_weight_end": 1.8,
+    },
+    "density_heavy": {
+        "overlap_weight_start": 5.0,
+        "overlap_weight_end": 100.0,
+        "density_weight_start": 0.8,
+        "density_weight_end": 0.5,
+        "congestion_weight_start": 0.7,
+        "congestion_weight_end": 0.7,
+    },
+}
+
+
 def _load_plc(name: str):
     from macro_place.loader import load_benchmark, load_benchmark_from_dir
 
@@ -126,7 +154,8 @@ class GPUPlacer:
 
         candidate_iters = self._analytical_iters(benchmark)
         analytical_starts = self._analytical_starts(benchmark)
-        for iters in candidate_iters:
+        for iters, profile_name in candidate_iters:
+            weight_profile = WEIGHT_PROFILES[profile_name]
             analytical = run_analytical_placement(
                 benchmark,
                 netlist,
@@ -137,16 +166,17 @@ class GPUPlacer:
                 time_budget_s=self._analytical_time_budget_s(benchmark, iters),
                 seed_positions=[initial_legalized_record["placement"]],
                 top_k=3,
+                **weight_profile,
             )
             candidate_records.extend(
                 self._score_legalize_variants(
-                    f"analytical_{iters}",
+                    f"analytical_{iters}_{profile_name}",
                     analytical["legalization_variants"],
                     benchmark,
                     plc,
                     stage="analytical",
                     prefix=(
-                        f"starts={analytical_starts} steps={analytical['executed_steps']}"
+                        f"profile={profile_name} starts={analytical_starts} steps={analytical['executed_steps']}"
                     ),
                     label="legalize",
                 )
@@ -371,12 +401,17 @@ class GPUPlacer:
             f"rem_ov={stats['remaining_overlap_count']}"
         )
 
-    def _analytical_iters(self, benchmark: Benchmark) -> list[int]:
+    def _analytical_iters(self, benchmark: Benchmark) -> list[tuple[int, str]]:
         if benchmark.num_hard_macros >= 400:
-            return [5, 15, 40]
+            return [(5, "balanced"), (15, "congestion_heavy"), (40, "density_heavy")]
         if benchmark.num_hard_macros >= 200:
-            return [5, 15, 50]
-        return [5, 15, 50, 150]
+            return [(5, "balanced"), (15, "congestion_heavy"), (50, "density_heavy")]
+        return [
+            (5, "balanced"),
+            (15, "congestion_heavy"),
+            (50, "density_heavy"),
+            (150, "density_heavy"),
+        ]
 
     def _analytical_starts(self, benchmark: Benchmark) -> int:
         if benchmark.num_hard_macros >= 400:

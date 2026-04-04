@@ -6,6 +6,9 @@ import torch
 from macro_place.benchmark import Benchmark
 
 
+LEGALIZE_DENSITY_GRID = 4
+
+
 def _clamp_point(
     x: float,
     y: float,
@@ -49,10 +52,12 @@ def _pairwise_overlap_matrix(positions: np.ndarray, sep_x: np.ndarray, sep_y: np
     return overlap
 
 
-def _quadrant_index(candidate: np.ndarray, canvas_w: float, canvas_h: float) -> int:
-    right = int(candidate[0] >= canvas_w * 0.5)
-    top = int(candidate[1] >= canvas_h * 0.5)
-    return top * 2 + right
+def _density_region_index(candidate: np.ndarray, canvas_w: float, canvas_h: float) -> int:
+    grid_w = max(canvas_w / LEGALIZE_DENSITY_GRID, 1.0e-6)
+    grid_h = max(canvas_h / LEGALIZE_DENSITY_GRID, 1.0e-6)
+    col = min(LEGALIZE_DENSITY_GRID - 1, max(0, int(candidate[0] / grid_w)))
+    row = min(LEGALIZE_DENSITY_GRID - 1, max(0, int(candidate[1] / grid_h)))
+    return row * LEGALIZE_DENSITY_GRID + col
 
 
 def _search_near_center(
@@ -74,11 +79,11 @@ def _search_near_center(
     best_legal_pos = None
     best_partial_key = (float("inf"), float("inf"), float("inf"), float("inf"))
     best_partial_pos = current.copy()
-    quadrant_counts = np.zeros(4, dtype=np.float64)
+    region_counts = np.zeros(LEGALIZE_DENSITY_GRID * LEGALIZE_DENSITY_GRID, dtype=np.float64)
     for other_idx, other in enumerate(positions):
         if other_idx == idx:
             continue
-        quadrant_counts[_quadrant_index(other, canvas_w, canvas_h)] += 1.0
+        region_counts[_density_region_index(other, canvas_w, canvas_h)] += 1.0
 
     for dxm in range(-radius, radius + 1):
         for dym in range(-radius, radius + 1):
@@ -95,7 +100,7 @@ def _search_near_center(
             overlap_count = float(np.count_nonzero(overlap > 0.0))
             disp_anchor = float(np.sum((candidate - anchor) ** 2))
             disp_current = float(np.sum((candidate - current) ** 2))
-            density_penalty = float(quadrant_counts[_quadrant_index(candidate, canvas_w, canvas_h)])
+            density_penalty = float(region_counts[_density_region_index(candidate, canvas_w, canvas_h)])
             key = (disp_anchor + density_penalty * 0.1, disp_current, overlap_count, total_overlap)
             if total_overlap == 0.0:
                 if best_legal_key is None or key < best_legal_key:
