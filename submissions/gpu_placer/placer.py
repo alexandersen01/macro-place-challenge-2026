@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import random
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -118,6 +119,7 @@ class GPUPlacer:
         self.device = get_default_device()
 
     def place(self, benchmark: Benchmark) -> torch.Tensor:
+        place_start_time = time.time()
         torch.manual_seed(self.seed)
         random.seed(self.seed)
         np.random.seed(self.seed)
@@ -242,6 +244,33 @@ class GPUPlacer:
             if self._is_better_record(sa_record, best_record):
                 best_record = sa_record
                 selected_placement = sa_candidate.detach().clone()
+
+        search_budget_s = self._exact_search_time_budget_s(benchmark, place_start_time)
+        if search_budget_s >= 15.0:
+            exact_search = self._exact_local_search(
+                selected_placement,
+                benchmark,
+                plc,
+                time_budget_s=search_budget_s,
+            )
+            exact_search_record = self._score_candidate(
+                "exact_search",
+                exact_search["placement"],
+                benchmark,
+                plc,
+                stage="exact_local_search",
+                notes=(
+                    f"iters={exact_search['iterations']} "
+                    f"evals={exact_search['evaluations']} "
+                    f"moves={exact_search['accepted_moves']} "
+                    f"step={exact_search['final_step']:.2f} "
+                    f"time={exact_search['elapsed_s']:.1f}s"
+                ),
+            )
+            candidate_records.append(exact_search_record)
+            if self._is_better_record(exact_search_record, best_record):
+                best_record = exact_search_record
+                selected_placement = exact_search["placement"].detach().clone()
 
         placement = selected_placement.detach().clone()
         gpu_cost = compute_proxy_cost(placement.to(self.device), benchmark, netlist)
@@ -400,6 +429,137 @@ class GPUPlacer:
             f"passes={stats['repair_passes']} "
             f"rem_ov={stats['remaining_overlap_count']}"
         )
+
+    def _exact_search_time_budget_s(self, benchmark: Benchmark, place_start_time: float) -> float:
+        remaining = max(0.0, 3000.0 - (time.time() - place_start_time))
+        if benchmark.num_hard_macros >= 400:
+            budget_cap_s = 60.0
+        elif benchmark.num_hard_macros >= 200:
+            budget_cap_s = 90.0
+        else:
+            budget_cap_s = 120.0
+        override = os.environ.get("GPU_PLACER_EXACT_SEARCH_MAX_S")
+        if override is None:
+            return min(remaining, budget_cap_s)
+        try:
+            return min(remaining, budget_cap_s, max(0.0, float(override)))
+        except ValueError:
+            return min(remaining, budget_cap_s)
+
+    def _clamp_macro_center(
+        self,
+        point: torch.Tensor,
+        size: torch.Tensor,
+        benchmark: Benchmark,
+    ) -> torch.Tensor:
+        half_w = float(size[0]) / 2.0
+        half_h = float(size[1]) / 2.0
+        x = min(max(float(point[0]), half_w), float(benchmark.canvas_width) - half_w)
+        y = min(max(float(point[1]), half_h), float(benchmark.canvas_height) - half_h)
+        return torch.tensor([x, y], dtype=point.dtype)
+
+    def _has_hard_macro_overlap(
+        self,
+        placement: torch.Tensor,
+        benchmark: Benchmark,
+        macro_idx: int,
+        safety_gap: float = 0.01,
+    ) -> bool:
+        n_hard = benchmark.num_hard_macros
+        sizes = benchmark.macro_sizes[:n_hard]
+        candidate = placement[macro_idx]
+        sep_x = (sizes[macro_idx, 0] + sizes[:n_hard, 0]) / 2.0 + safety_gap
+        sep_y = (sizes[macro_idx, 1] + sizes[:n_hard, 1]) / 2.0 + safety_gap
+        dx = (placement[:n_hard, 0] - candidate[0]).abs()
+        dy = (placement[:n_hard, 1] - candidate[1]).abs()
+        overlaps = (dx < sep_x) & (dy < sep_y)
+        overlaps[macro_idx] = False
+        return bool(torch.any(overlaps).item())
+
+    def _exact_local_search(
+        self,
+        placement: torch.Tensor,
+        benchmark: Benchmark,
+        plc,
+        time_budget_s: float,
+    ) -> dict:
+        current = placement.detach().clone().cpu()
+        best = current.clone()
+        start_time = time.time()
+        evaluations = 0
+        iterations = 0
+        accepted_moves = 0
+
+        movable = benchmark.get_movable_mask()[: benchmark.num_hard_macros]
+        sizes = benchmark.macro_sizes[: benchmark.num_hard_macros]
+        areas = sizes[:, 0] * sizes[:, 1]
+        macro_order = [
+            idx
+            for idx in torch.argsort(-areas).tolist()
+            if bool(movable[idx].item())
+        ]
+        if not macro_order:
+            return {
+                "placement": best,
+                "evaluations": evaluations,
+                "iterations": iterations,
+                "final_step": 0.0,
+            }
+
+        directions = [
+            (-1.0, 0.0),
+            (1.0, 0.0),
+            (0.0, -1.0),
+            (0.0, 1.0),
+            (-1.0, -1.0),
+            (-1.0, 1.0),
+            (1.0, -1.0),
+            (1.0, 1.0),
+        ]
+        step = max(float(max(benchmark.canvas_width, benchmark.canvas_height)) * 0.02, 1.0)
+        min_step = 0.25
+        current_score = float(exact_proxy_cost(best, benchmark, plc)["proxy_cost"])
+
+        while step >= min_step and (time.time() - start_time) < time_budget_s:
+            improved = False
+            iterations += 1
+            for macro_idx in macro_order:
+                if (time.time() - start_time) >= time_budget_s:
+                    break
+                origin = best[macro_idx].clone()
+                for dx, dy in directions:
+                    if (time.time() - start_time) >= time_budget_s:
+                        break
+                    candidate = best.clone()
+                    shift = torch.tensor([dx * step, dy * step], dtype=candidate.dtype)
+                    candidate[macro_idx] = self._clamp_macro_center(
+                        origin + shift,
+                        sizes[macro_idx],
+                        benchmark,
+                    )
+                    if self._has_hard_macro_overlap(candidate, benchmark, macro_idx):
+                        continue
+                    evaluations += 1
+                    score = float(exact_proxy_cost(candidate, benchmark, plc)["proxy_cost"])
+                    if score + 1.0e-4 < current_score:
+                        best = candidate
+                        current_score = score
+                        improved = True
+                        accepted_moves += 1
+                        break
+                if improved:
+                    break
+            if not improved:
+                step *= 0.5
+
+        return {
+            "placement": best,
+            "evaluations": evaluations,
+            "iterations": iterations,
+            "accepted_moves": accepted_moves,
+            "final_step": step,
+            "elapsed_s": time.time() - start_time,
+        }
 
     def _analytical_iters(self, benchmark: Benchmark) -> list[tuple[int, str]]:
         if benchmark.num_hard_macros >= 400:
